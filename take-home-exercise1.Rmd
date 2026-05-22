@@ -1,0 +1,521 @@
+---
+title: "Take-home Exercise 1"
+author: "LI XINYUE"
+date: "2026-05-22"
+output: html_document
+---
+
+# Beyond Premiums: Investigating Profitability and Volatility Drivers in a Spanish Motor Insurance Portfolio
+
+## 1 Introduction
+
+### 1.1 Background
+
+Motor insurance is one of the largest and most competitive lines in non-life insurance. Insurers price each policy individually, but the financial health of the business is determined at the **portfolio level** -- whether premiums collected across many policies are sufficient to pay the claims that ultimately emerge.
+
+Two questions are central to portfolio management:
+
+- **Profitability** -- Are premiums adequate to cover incurred losses?
+
+- **Volatility** -- How stable are the results across policies and over time?
+
+A portfolio can be profitable on average yet so unstable that a single bad year wipes out years of profit. Understanding which customer, vehicle, and policy characteristics drive both dimensions is therefore essential for sound underwriting and pricing.
+
+### 1.2 Objective and the Analytical Questions
+
+The objective of this take-home exercise is to use appropriate **Exploratory Data Analysis (EDA)** and **statistical visualisation techniques** in R to investigate the drivers of profitability and volatility in a real-world Spanish motor insurance portfolio.
+
+The analytical questions are:
+
+- What is the distribution of premiums, incurred losses, and loss ratios in the portfolio? Which categorical segments dominate the book?
+
+- Which driver, vehicle, and policy characteristics are associated with higher loss ratios (lower profitability)?
+
+- Which segments combine **both** poor profitability and high volatility, making them priority targets for re-pricing or stricter underwriting?
+
+## 2 Getting Started
+
+### 2.1 Setting the Analytical Tools
+
+The R packages used in this take-home exercise are:
+
+- [**tidyverse**](https://www.tidyverse.org/) for data import, wrangling, and `ggplot2`-based graphics;
+
+- [**janitor**](https://cran.r-project.org/web/packages/janitor/) for `clean_names()` to standardise column names;
+
+- [**skimr**](https://cran.r-project.org/web/packages/skimr/) for quick descriptive summaries;
+
+- [**ggdist**](https://mjskay.github.io/ggdist/) and [**ggridges**](https://cran.r-project.org/web/packages/ggridges/) for distribution and uncertainty visualisations;
+
+- [**ggstatsplot**](https://indrajeetpatil.github.io/ggstatsplot/) for plots that embed statistical test results;
+
+- [**ggcorrplot**](https://rpkgs.datanovia.com/ggcorrplot/) for correlation matrix heatmaps;
+
+- [**GGally**](https://ggobi.github.io/ggally/) for parallel coordinate plots;
+
+- [**ggiraph**](https://davidgohel.github.io/ggiraph/) for interactive `ggplot2` charts;
+
+- [**treemapify**](https://wilkox.org/treemapify/) for treemap visualisations; and
+
+- [**tidytext**](https://juliasilge.github.io/tidytext/) for `reorder_within()` to sort categorical levels within each facet.
+
+The `p_load()` function in the **pacman** package checks if the packages are installed and loads them; missing packages are installed first.
+
+```{r setup, include=FALSE}
+pacman::p_load(tidyverse, janitor, skimr, scales, patchwork,
+               ggdist, ggridges, ggstatsplot, ggcorrplot, GGally,
+               ggiraph, treemapify, DT, tidytext)
+insurance_raw <- read_delim("Dataset of motor insurance portfolio.csv",
+                            delim = ";",
+                            locale = locale(decimal_mark = "."),
+                            show_col_types = FALSE) %>%
+  clean_names()
+```
+
+### 2.2 Data Sources
+
+The dataset used in this take-home exercise is the publicly available *Dataset of motor insurance portfolio* from a Spanish non-life insurer, accompanied by a descriptive cookbook (`Descriptive of variables.xlsx`).
+
+Each row records one **policy-year**: the same policy is observed up to three times across 2022, 2023, and 2024. The file contains 354,140 policy-year records and 47 variables, organised into four groups -- policy and insured characteristics, driver and vehicle characteristics, premiums broken down by coverage, and exposure / claims / incurred losses also broken down by coverage.
+
+Three notes from the cookbook shape the analysis:
+
+- `age_driving_licence` is the **calendar year the licence was issued**, not years held; it must be converted to a tenure variable.
+
+- `total_exposure` is time-on-risk in policy years (0 to 1); financial figures should be read relative to it.
+
+- `total_incurred` is the sum of paid amounts and outstanding reserves.
+
+## 3 Data Wrangling
+
+### 3.1 Importing Data
+
+The CSV is **semicolon-delimited** with a `.` decimal mark. `read_delim()` from the **readr** package is used with explicit `delim` and `locale` arguments so that all numeric columns are parsed correctly. `clean_names()` from the **janitor** package then standardises column names to snake_case.
+
+```{r}
+glimpse(insurance_raw)
+```
+
+### 3.2 Checking for Missing Values
+
+The `summarise()` and `across()` functions in the **dplyr** package are used to count missing values per column. Only columns with at least one missing value are retained.
+
+```{r}
+insurance_raw %>%
+  summarise(across(everything(), ~ sum(is.na(.x)))) %>%
+  pivot_longer(everything(), names_to = "variable", values_to = "n_missing") %>%
+  filter(n_missing > 0) %>%
+  arrange(desc(n_missing))
+```
+
+***Observation***: `fuel_type` is missing for about 0.36% of rows, `vehicle_value` for 0.14%, and `vehicle_age` / `age_driving_licence` for two rows each. Missingness is too small to affect aggregate findings, but each variable is handled explicitly in the cleaning step below.
+
+### 3.3 Structural Data Quality Checks
+
+Beyond missingness, structural anomalies are checked: zero premiums, zero exposure, negative incurred losses, and impossible licence years.
+
+```{r}
+insurance_raw %>%
+  summarise(zero_premium   = sum(total_premium == 0),
+            zero_exposure  = sum(total_exposure == 0),
+            negative_incur = sum(total_incurred < 0),
+            licence_yr_0   = sum(age_driving_licence == 0, na.rm = TRUE))
+```
+
+***Observation***: 49 policy-years have both zero premium and zero exposure (non-effective policies) and are removed. Two rows have an impossible licence year of 0 and are removed. There are no negative incurred costs.
+
+### 3.4 Cleaning and Type Conversion
+
+The `filter()` and `mutate()` functions in the **dplyr** package are used to remove invalid rows and convert character columns into factors with readable labels. `fct_na_value_to_level()` from the **forcats** package converts missing `fuel_type` values into an explicit "Unknown" category rather than dropping the rows.
+
+```{r}
+insurance <- insurance_raw %>%
+  filter(total_premium > 0, total_exposure > 0) %>%
+  filter(!is.na(age_driving_licence), age_driving_licence > 0) %>%
+  mutate(fuel_type = fct_na_value_to_level(as_factor(fuel_type),
+                                           level = "Unknown"),
+         policy_type = factor(policy_type,
+                              levels = c("TP", "TPG", "CC",
+                                         "COMP_E", "COMP_N")),
+         policy_status = factor(policy_status, levels = c("A", "C"),
+                                labels = c("Active", "Cancelled")),
+         business_type = factor(business_type, levels = c("NB", "P"),
+                                labels = c("New business", "Portfolio")),
+         payment_frequency = factor(payment_frequency,
+                                    levels = c("A", "S", "Q"),
+                                    labels = c("Annual", "Semiannual",
+                                               "Quarterly")),
+         bonus_score = factor(bonus_score, levels = c("B", "N", "G"),
+                              labels = c("Bad", "Neutral", "Good")),
+         municipality_type = factor(municipality_type,
+                                    levels = c("I", "C", "IS"),
+                                    labels = c("Inland", "Coastal",
+                                               "Islands")),
+         circulation_area = factor(circulation_area, levels = c("U", "R"),
+                                   labels = c("Urban", "Rural")),
+         year = as_factor(year))
+```
+
+### 3.5 Deriving Profitability and Volatility Variables
+
+The raw file does not contain a "profit" column. The central wrangling task is therefore to engineer one from premium, incurred losses, and exposure. The `mutate()` function in the **dplyr** package is used to derive:
+
+- `licence_years` -- years of driving experience (calendar year minus licence-issue year);
+
+- `loss_ratio` -- incurred losses divided by premium (the standard profitability metric in insurance; values below 1 are profitable);
+
+- `uw_result` -- underwriting result in monetary terms (premium minus incurred losses);
+
+- `has_claim` and `profitable` -- categorical flags for segmentation;
+
+- `claim_freq` -- claims per unit of exposure;
+
+- `driver_age_grp` and `vehicle_age_grp` -- binned age variables.
+
+The `loss_ratio` is also capped at the 99th percentile (`loss_ratio_capped`) for visualisation purposes; the raw `loss_ratio` is retained for statistical tests.
+
+```{r}
+insurance <- insurance %>%
+  mutate(licence_years   = as.numeric(as.character(year)) - age_driving_licence,
+         loss_ratio      = total_incurred / total_premium,
+         uw_result       = total_premium - total_incurred,
+         premium_per_exp = total_premium / total_exposure,
+         profitable      = if_else(loss_ratio <= 1,
+                                   "Profitable", "Loss-making"),
+         has_claim       = if_else(total_claims > 0, "Claim", "No claim"),
+         claim_freq      = total_claims / total_exposure,
+         avg_claim_cost  = if_else(total_claims > 0,
+                                   total_incurred / total_claims, 0),
+         driver_age_grp  = cut(driver_age,
+                               breaks = c(17, 25, 35, 50, 65, Inf),
+                               labels = c("18-25", "26-35", "36-50",
+                                          "51-65", "65+")),
+         vehicle_age_grp = cut(vehicle_age,
+                               breaks = c(-Inf, 5, 10, 20, Inf),
+                               labels = c("0-5", "6-10", "11-20", "20+"))) %>%
+  mutate(loss_ratio_capped = pmin(loss_ratio,
+                                  quantile(loss_ratio, 0.99, na.rm = TRUE)))
+```
+
+A quick summary of the derived variables is produced using the `skim()` function in the **skimr** package.
+
+```{r}
+skim(insurance %>% select(loss_ratio, uw_result, claim_freq,
+                          licence_years, driver_age, vehicle_age))
+```
+
+### 3.6 A Reusable Segment Profiler
+
+Profitability (`loss_ratio`) and underwriting result (`uw_result`) are measured for each single policy-year. **Volatility cannot be observed on a single policy** -- it is a property of a *group* of policies, capturing how unpredictable results are inside that group.
+
+A reusable helper function, `segment_summary()`, is therefore defined. For any grouping variable, it computes the number of policies, total premium, total incurred, portfolio loss ratio (profitability), and the standard deviation and coefficient of variation of the loss ratio (volatility).
+
+```{r}
+segment_summary <- function(df, group_var) {
+  df %>%
+    group_by({{ group_var }}) %>%
+    summarise(n_policies   = n(),
+              total_prem   = sum(total_premium),
+              total_inc    = sum(total_incurred),
+              portfolio_lr = total_inc / total_prem,
+              mean_lr      = mean(loss_ratio, na.rm = TRUE),
+              sd_lr        = sd(loss_ratio, na.rm = TRUE),
+              cv_lr        = sd_lr / mean_lr,
+              claim_freq   = mean(claim_freq, na.rm = TRUE),
+              .groups = "drop")
+}
+segment_summary(insurance, policy_type)
+```
+
+***Observation***: At the policy-type level, comprehensive products (COMP_E and COMP_N) carry the highest loss ratios while third-party-only policies (TP) sit lowest -- a first hint that broader coverage products are less profitable on average.
+
+## 4 Exploratory Data Analysis
+
+### 4.1 Univariate Analysis -- Numerical Variables
+
+A faceted histogram is created to visualise the distribution of all key numerical variables at once. The `pivot_longer()` function in the **tidyr** package reshapes the data into long form, and `facet_wrap()` in the **ggplot2** package creates one panel per variable.
+
+```{r}
+num_vars <- c("total_premium", "total_incurred", "loss_ratio_capped",
+              "driver_age", "vehicle_age", "vehicle_value",
+              "power_to_weight_ratio", "licence_years")
+insurance %>%
+  select(all_of(num_vars)) %>%
+  pivot_longer(everything(), names_to = "variable", values_to = "value") %>%
+  ggplot(aes(value)) +
+  geom_histogram(bins = 40, fill = "#2c7fb8", colour = "white") +
+  facet_wrap(~ variable, scales = "free", ncol = 4) +
+  labs(title = "Distribution of Key Numerical Variables",
+       x = NULL, y = "Count") +
+  theme_minimal(base_size = 11)
+```
+
+***Observation***: `driver_age` is roughly symmetric around 50, while `vehicle_age`, `vehicle_value`, and `power_to_weight_ratio` are right-skewed. `total_premium` and `total_incurred` are heavily right-skewed, with the vast majority of policies clustering at low values. The most extreme skew is in `loss_ratio_capped`: most policy-years have a loss ratio at or near zero, with a thin tail of large losses driving the risk.
+
+A closer look at the loss ratio -- the central profitability variable -- is produced using `stat_halfeye()` from the **ggdist** package, which combines a density curve with the median and credible interval. A dashed line marks the break-even point (LR = 1).
+
+```{r}
+ggplot(insurance, aes(x = loss_ratio_capped)) +
+  stat_halfeye(fill = "#2c7fb8", alpha = .7) +
+  geom_vline(xintercept = 1, linetype = "dashed", colour = "red") +
+  annotate("text", x = 1.1, y = 0.9, hjust = 0,
+           label = "Break-even (LR = 1)", colour = "red") +
+  labs(title = "Loss Ratio is Extremely Right-Skewed",
+       x = "Loss ratio (capped at 99th percentile)", y = NULL) +
+  theme_minimal(base_size = 12)
+```
+
+***Observation***: Roughly 86% of policy-years have no claims at all, so the modal loss ratio is zero. Among the remaining 14%, a small number of large-loss policies pull the upper tail far past the break-even line. This heavy-tailed shape has two consequences for the rest of the analysis: (i) the loss ratio must be **capped** for visual clarity, and (ii) **non-parametric statistical tests** are preferred over t-tests or ANOVA, which assume normality.
+
+### 4.2 Univariate Analysis -- Categorical Variables
+
+A faceted bar chart summarises the frequency of each categorical variable. `reorder_within()` from the **tidytext** package sorts the levels within each facet by frequency.
+
+```{r}
+cat_vars <- c("policy_type", "policy_status", "business_type",
+              "payment_frequency", "bonus_score", "fuel_type",
+              "municipality_type", "circulation_area")
+insurance %>%
+  select(all_of(cat_vars)) %>%
+  mutate(across(everything(), as.character)) %>%
+  pivot_longer(everything(), names_to = "variable", values_to = "level") %>%
+  count(variable, level) %>%
+  ggplot(aes(x = reorder_within(level, n, variable), y = n)) +
+  geom_col(fill = "#41b6c4") +
+  facet_wrap(~ variable, scales = "free", ncol = 4) +
+  scale_x_reordered() +
+  coord_flip() +
+  labs(title = "Frequency of Categorical Variables",
+       x = NULL, y = "Number of policy-years") +
+  theme_minimal(base_size = 11)
+```
+
+***Observation***: The portfolio composition reveals several important features. `bonus_score` is extremely imbalanced -- about 96% of policy-years are rated "Good", and only ~1% are rated "Bad". This raises a question about whether the bonus-malus system is sufficiently discriminating to separate good and bad risks. `policy_type` is dominated by combined-coverage (CC) policies; `business_type` is mostly new business; and the portfolio is roughly evenly split between urban and rural circulation areas.
+
+### 4.3 Bivariate Analysis -- Categorical Driver vs Profitability
+
+The `ggbetweenstats()` function in the **ggstatsplot** package produces a violin-and-box plot of loss ratio across categorical groups **and embeds the result of a statistical test** in the figure subtitle. Because the loss ratio is heavily skewed, the non-parametric Kruskal-Wallis test is used (`type = "nonparametric"`).
+
+```{r}
+ggbetweenstats(data  = insurance,
+               x     = policy_type,
+               y     = loss_ratio_capped,
+               type  = "nonparametric",
+               title = "Loss Ratio by Policy Type")
+```
+
+***Observation***: The Kruskal-Wallis test confirms a highly significant difference in loss-ratio distributions across policy types. Comprehensive policies (COMP_E, COMP_N) sit at higher loss-ratio levels than third-party-only policies (TP, TPG), confirming that broader coverage products are less profitable in this book.
+
+The same analysis is then applied to the bonus-malus score, which by design should separate good and bad risks.
+
+```{r}
+ggbetweenstats(data  = insurance,
+               x     = bonus_score,
+               y     = loss_ratio_capped,
+               type  = "nonparametric",
+               title = "Loss Ratio by Bonus-Malus Score")
+```
+
+***Observation***: The bonus score does separate the three groups in the statistically expected direction -- "Bad" policies have the highest loss ratios. However, given how few "Bad" policy-years exist in the portfolio (~1%), the bonus-malus mechanism may not be granular enough to identify a wider population of underperforming risks.
+
+### 4.4 Bivariate Analysis -- Categorical Driver vs Claim Occurrence
+
+Beyond loss ratio, it is also useful to ask whether a binary categorical outcome -- *whether a claim occurred at all* -- depends on the segment. The `ggbarstats()` function in **ggstatsplot** performs a chi-square test of independence and embeds the result.
+
+```{r}
+ggbarstats(data  = insurance,
+           x     = has_claim,
+           y     = circulation_area,
+           title = "Claim Occurrence by Circulation Area")
+```
+
+***Observation***: Urban policy-years have a slightly higher proportion of policies with at least one claim than rural ones, and the chi-square test confirms the difference is statistically significant. This is consistent with the conventional view that urban driving carries higher claim frequency due to traffic density.
+
+### 4.5 Bivariate Analysis -- Numerical Driver vs Profitability
+
+The `ggscatterstats()` function in **ggstatsplot** produces a scatter plot with marginal distributions and embedded correlation test.
+
+```{r}
+ggscatterstats(data  = insurance,
+               x     = driver_age,
+               y     = loss_ratio_capped,
+               type  = "nonparametric",
+               title = "Driver Age vs Loss Ratio")
+```
+
+***Observation***: The Spearman correlation between driver age and loss ratio is weak in magnitude but statistically significant given the large sample size. The relationship is not linear -- younger drivers visibly cluster at higher loss ratios, consistent with industry expectations.
+
+A correlation matrix across all numeric drivers and outcomes is then produced using Spearman correlation (robust to the heavy skew of the financial variables).
+
+```{r}
+insurance %>%
+  select(driver_age, vehicle_age, licence_years, vehicle_value,
+         power_to_weight_ratio, total_premium, total_incurred,
+         loss_ratio, claim_freq) %>%
+  drop_na() %>%
+  cor(method = "spearman") %>%
+  ggcorrplot(type = "lower", lab = TRUE, lab_size = 3,
+             colors = c("#d7191c", "white", "#2c7fb8"),
+             title = "Spearman Correlation Among Numeric Variables")
+```
+
+***Observation***: `driver_age` and `licence_years` are strongly positively correlated, as expected. `vehicle_value` is strongly correlated with `total_premium`, confirming that the pricing model already accounts for vehicle value. Crucially, all numeric variables show only weak correlations with `loss_ratio` -- no single continuous variable explains profitability on its own, which is why segment-level analysis is needed.
+
+### 4.6 The Profitability-Volatility Map
+
+The defining visualisation of this analysis combines both dimensions onto a single chart. Each point represents one driver-age segment: the x-axis shows portfolio loss ratio (profitability), the y-axis shows the coefficient of variation (volatility), and bubble size shows segment size.
+
+```{r}
+seg <- segment_summary(insurance, driver_age_grp) %>%
+  drop_na(driver_age_grp)
+ggplot(seg, aes(x = portfolio_lr, y = cv_lr, size = n_policies,
+                label = driver_age_grp)) +
+  geom_point(colour = "#2c7fb8", alpha = .7) +
+  geom_text(vjust = -1.4, size = 3.5) +
+  geom_vline(xintercept = 0.7, linetype = "dashed", colour = "grey50") +
+  scale_size(range = c(5, 16)) +
+  labs(title = "Profitability vs Volatility by Driver Age Group",
+       x = "Portfolio loss ratio",
+       y = "Coefficient of variation of loss ratio",
+       size = "Policy-years") +
+  theme_minimal(base_size = 12)
+```
+
+***Observation***: The 18-25 group sits in the worst position -- highest loss ratio (least profitable) **and** highest CV (most volatile). The 51-65 group is the most profitable and stable. This is the most actionable single chart in the analysis: it points directly to the segments that justify re-pricing or stricter underwriting.
+
+### 4.7 Temporal View
+
+Tracking portfolio loss ratio over the three years allows us to see whether profitability is trending in the right direction.
+
+```{r}
+insurance %>%
+  group_by(year, policy_type) %>%
+  summarise(portfolio_lr = sum(total_incurred) / sum(total_premium),
+            .groups = "drop") %>%
+  ggplot(aes(x = year, y = portfolio_lr, colour = policy_type,
+             group = policy_type)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2.5) +
+  labs(title = "Portfolio Loss Ratio Trend by Policy Type (2022-2024)",
+       x = NULL, y = "Portfolio loss ratio", colour = "Policy type") +
+  theme_minimal(base_size = 12)
+```
+
+***Observation***: Most policy types show rising loss ratios over the three years, indicating deteriorating profitability. Comprehensive products (COMP_E and COMP_N) deteriorate fastest, reinforcing the earlier finding that these are the priority products for repricing review.
+
+### 4.8 Going Beyond -- Distribution Shape via Ridgeline Plot
+
+A comparison of means (as in section 4.3) can hide differences in distribution *shape*. A ridgeline plot of the loss ratio for policy-years with at least one claim reveals the full conditional distribution. `geom_density_ridges()` is from the **ggridges** package.
+
+```{r}
+insurance %>%
+  filter(has_claim == "Claim") %>%
+  ggplot(aes(x = loss_ratio_capped, y = fct_rev(policy_type),
+             fill = policy_type)) +
+  geom_density_ridges(alpha = .7, scale = 1.3) +
+  geom_vline(xintercept = 1, linetype = "dashed") +
+  labs(title = "Loss-Ratio Distribution Shape by Policy Type",
+       x = "Loss ratio (capped)", y = NULL) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "none")
+```
+
+***Observation***: Among claiming policies, third-party-only (TP) products show a much wider distribution of loss ratios than comprehensive products. This reflects the lower premium base of TP policies -- a single bodily-injury claim can produce a very large loss ratio because the denominator is small.
+
+### 4.9 Going Beyond -- Interactive Scatter
+
+`geom_point_interactive()` and `girafe()` from the **ggiraph** package add hover tooltips to a sampled scatter of premium versus incurred loss. The dashed reference line is break-even.
+
+```{r}
+plot_df <- insurance %>% slice_sample(n = 3000)
+gg <- ggplot(plot_df,
+             aes(x = total_premium, y = total_incurred,
+                 colour = profitable,
+                 tooltip = paste0("Premium: ", round(total_premium),
+                                  "\nIncurred: ", round(total_incurred),
+                                  "\nLR: ", round(loss_ratio, 2)))) +
+  geom_point_interactive(alpha = .5) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed") +
+  scale_colour_manual(values = c("Profitable" = "#2c7fb8",
+                                 "Loss-making" = "#d7191c")) +
+  labs(title = "Premium vs Incurred Loss",
+       x = "Total premium", y = "Total incurred") +
+  theme_minimal(base_size = 12)
+girafe(ggobj = gg, width_svg = 8, height_svg = 5)
+```
+
+***Observation***: The plot reveals the visual signature of the heavy tail -- a dense cluster of profitable policies along the x-axis (premium paid, no claims), and a thin scatter of loss-making policies that lie far above the break-even line. A few extreme outliers carry incurred losses an order of magnitude above their premiums.
+
+### 4.10 Going Beyond -- Treemap of Premium Volume
+
+The treemap below uses `geom_treemap()` from the **treemapify** package to show where the portfolio's premium money sits. Each tile is one policy-type × profit-status block; tile area shows premium volume and colour shows loss ratio.
+
+```{r}
+insurance %>%
+  group_by(policy_type, profitable) %>%
+  summarise(prem = sum(total_premium),
+            lr   = sum(total_incurred) / sum(total_premium),
+            .groups = "drop") %>%
+  ggplot(aes(area = prem, fill = lr, subgroup = policy_type,
+             label = profitable)) +
+  geom_treemap() +
+  geom_treemap_subgroup_border(colour = "white") +
+  geom_treemap_subgroup_text(colour = "white", fontface = "bold",
+                             place = "centre", grow = FALSE) +
+  geom_treemap_text(colour = "grey95", place = "bottomleft", size = 9) +
+  scale_fill_gradient2(low = "#2c7fb8", mid = "white", high = "#d7191c",
+                       midpoint = 0.7, name = "Loss ratio") +
+  labs(title = "Premium Volume by Policy Type and Profit Status") +
+  theme_minimal(base_size = 12)
+```
+
+***Observation***: The CC (combined coverage) tile is by far the largest -- it represents most of the portfolio's premium income. The loss-making sub-block within CC is therefore the highest-priority area for management action: even a small improvement in loss ratio here would materially improve overall results.
+
+### 4.11 Going Beyond -- Multivariate Profile via Parallel Coordinates
+
+Parallel coordinates plots compare many variables simultaneously across two groups. `ggparcoord()` is from the **GGally** package.
+
+```{r}
+insurance %>%
+  slice_sample(n = 2000) %>%
+  select(profitable, driver_age, vehicle_age, licence_years,
+         total_premium, power_to_weight_ratio, vehicle_value) %>%
+  drop_na() %>%
+  ggparcoord(columns = 2:7, groupColumn = 1, scale = "uniminmax",
+             alphaLines = .12) +
+  scale_colour_manual(values = c("Profitable" = "#2c7fb8",
+                                 "Loss-making" = "#d7191c")) +
+  labs(title = "Multivariate Profile: Profitable vs Loss-making Policy-years",
+       x = NULL, y = "Scaled value") +
+  theme_minimal(base_size = 12)
+```
+
+***Observation***: Loss-making (red) and profitable (blue) lines overlap heavily across every dimension. No single variable -- or simple combination of variables -- cleanly separates the two groups. This confirms that catastrophic claims are largely *random events* given the available risk factors, which is an important insight in itself: it implies that the right management response is diversification and reinsurance, not just better risk selection.
+
+## 5 Conclusion
+
+This take-home exercise has shown how **visual analytics in R**, combined with statistical validation through `ggstatsplot`, can systematically uncover the drivers of profitability and volatility in a real-world motor insurance portfolio.
+
+The key findings are:
+
+- **Policy type** is the strongest categorical driver of profitability: comprehensive products carry meaningfully higher loss ratios than third-party-only products, and the gap is widening over 2022-2024.
+
+- **Driver age** drives both profitability and volatility: the 18-25 segment is least profitable *and* most volatile, while the 51-65 segment is most profitable and stable.
+
+- The **bonus-malus score** works in the right direction but is extremely imbalanced (96% rated "Good"), suggesting limited discriminatory power for forward-looking risk selection.
+
+- Catastrophic claims are largely random given the observable risk factors -- visible in the parallel coordinates plot. The right response is diversification and reinsurance, not just better selection.
+
+Methodologically, the analysis demonstrates the importance of (i) deriving the profitability and volatility metrics from raw premium and claims fields, since they are not present in the data; and (ii) using **non-parametric statistical tests** because of the heavy right-skew of the loss-ratio distribution.
+
+## 6 Key References
+
+- [R for Visual Analytics](https://r4va.netlify.app/).
+
+- [R for Data Science](https://r4ds.hadley.nz/).
+
+- [ggstatsplot documentation](https://indrajeetpatil.github.io/ggstatsplot/).
+
+- Dataset & cookbook: *Dataset of motor insurance portfolio* (Mendeley Data).
+
+**~~~ End of Take-home Exercise 1 ~~~**
